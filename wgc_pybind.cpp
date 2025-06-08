@@ -81,8 +81,8 @@ public:
             py_info["timestamp"] = frame_data->timestamp;
             try {
                 std::cerr << "[PyWGCCapture] C++: calling Python callback..." << std::endl;
-                cap->release_frame(frame_data);
                 callback(array, py_info);
+                cap->release_frame(frame_data);
                 std::cerr << "[PyWGCCapture] C++: Python callback completed" << std::endl;
             } catch (const py::error_already_set& e) {
                 std::cerr << "[PyWGCCapture] C++: Python error in callback: " << e.what() << std::endl;
