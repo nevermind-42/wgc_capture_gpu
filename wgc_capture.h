@@ -23,7 +23,12 @@
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 
+#include <cuda_runtime.h>
+#include <cuda_d3d11_interop.h>
+#include <pybind11/numpy.h>
+
 using Microsoft::WRL::ComPtr;
+using namespace winrt;
 
 // Структура для хранения кадра и его метаданных
 struct FrameData {
@@ -38,20 +43,21 @@ struct FrameData {
 
 class WGCCapture {
 public:
-    WGCCapture(bool use_bgra = true);
+    WGCCapture(bool use_bgra = false);
     ~WGCCapture();
 
     // Инициализация и запуск захвата
     bool start_capture();
     void stop_capture();
+    bool is_capturing() const { return is_capturing_; }
     
     // Установка callback для новых кадров
     // callback получает указатель на FrameData, который можно безопасно использовать
     // пока не вызван метод release_frame
     void set_frame_callback(std::function<void(FrameData*)> callback);
     
-    // Получение информации о мониторе
-    std::vector<std::pair<int, int>> get_monitor_info() const;
+    // Получение информации о мониторах
+    std::vector<std::tuple<int, int, int, int>> get_monitor_info() const;
     
     // Получение кадра
     // Возвращает указатель на FrameData, который нужно освободить через release_frame
@@ -59,6 +65,9 @@ public:
     
     // Освобождение кадра (уменьшение счетчика ссылок)
     void release_frame(FrameData* frame);
+    
+    // Захват кадра напрямую в CUDA память
+    bool capture_to_cuda(void** cuda_ptr, size_t* pitch);
     
 private:
     // Внутренние методы
@@ -68,12 +77,12 @@ private:
     // Члены класса для Direct3D
     ComPtr<ID3D11Device> d3d_device_;
     ComPtr<ID3D11DeviceContext> d3d_context_;
-    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice d3d_device_winrt_{nullptr};
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice d3d_device_winrt_;
     
     // Члены класса для Windows Graphics Capture
-    winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item_{nullptr};
-    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool_{nullptr};
-    winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session_{nullptr};
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item_ = nullptr;
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool_ = nullptr;
+    winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session_ = nullptr;
     
     // Члены класса для управления кадрами
     mutable std::mutex frame_mutex_;
@@ -85,6 +94,21 @@ private:
     // Callback для новых кадров
     std::function<void(FrameData*)> frame_callback_;
     
-    // Информация о мониторе
-    std::vector<std::pair<int, int>> monitor_info_;
+    // CUDA ресурсы
+    cudaGraphicsResource* cuda_resource_ = nullptr;
+    cudaStream_t cuda_stream_ = nullptr;
+    
+    // Размеры захвата
+    int width_ = 0;
+    int height_ = 0;
+    
+    // Инициализация CUDA-D3D11 интеропа
+    bool init_cuda_interop(ID3D11Texture2D* texture);
+    void cleanup_cuda_resources();
+    
+    // Вспомогательные функции
+    static winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice CreateDirect3DDevice(ID3D11Device* d3d_device);
+    static ComPtr<ID3D11Device> GetD3D11Device(winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice const& device);
+
+    std::vector<std::tuple<int, int, int, int>> monitor_info_;
 }; 

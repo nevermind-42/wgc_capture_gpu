@@ -33,6 +33,16 @@ public:
         cap->stop_capture();
     }
 
+    bool capture_to_cuda(void** cuda_ptr, size_t* pitch) {
+        if (debug_mode) std::cerr << "[PyWGCCapture] Calling capture_to_cuda..." << std::endl;
+        try {
+            return cap->capture_to_cuda(cuda_ptr, pitch);
+        } catch (const std::exception& e) {
+            if (debug_mode) std::cerr << "[PyWGCCapture] Exception in capture_to_cuda: " << e.what() << std::endl;
+            throw std::runtime_error("Failed to capture to CUDA");
+        }
+    }
+
     py::array get_frame(int timeout_ms = 1) {
         if (debug_mode) std::cerr << "[PyWGCCapture] Calling get_frame..." << std::endl;
         try {
@@ -57,10 +67,10 @@ public:
     // Set callback for new frames
     void set_frame_callback(py::function callback) {
         cap->set_frame_callback([callback, this](FrameData* frame_data) {
-            std::cerr << "[PyWGCCapture] C++: frame_callback called, frame=" << (frame_data ? "OK" : "nullptr") << std::endl;
+            if (debug_mode) std::cerr << "[PyWGCCapture] C++: frame_callback called, frame=" << (frame_data ? "OK" : "nullptr") << std::endl;
             py::gil_scoped_acquire gil;
             if (!frame_data || frame_data->frame.empty()) {
-                std::cerr << "[PyWGCCapture] C++: frame_data is empty in callback" << std::endl;
+                if (debug_mode) std::cerr << "[PyWGCCapture] C++: frame_data is empty in callback" << std::endl;
                 return;
             }
             cv::Mat& frame = frame_data->frame;
@@ -74,18 +84,18 @@ public:
                     auto size = std::any_cast<std::vector<int>>(it->second);
                     py_info["original_size"] = py::cast(size);
                 } catch (const std::bad_any_cast&) {
-                    std::cerr << "[PyWGCCapture] C++: Failed to cast 'original_size'" << std::endl;
-                }
+                    if (debug_mode) std::cerr << "[PyWGCCapture] C++: Failed to cast 'original_size'" << std::endl;
+        }
             }
             py_info["is_bgra"] = frame_data->is_bgra;
             py_info["timestamp"] = frame_data->timestamp;
             try {
-                std::cerr << "[PyWGCCapture] C++: calling Python callback..." << std::endl;
+                if (debug_mode) std::cerr << "[PyWGCCapture] C++: calling Python callback..." << std::endl;
                 callback(array, py_info);
                 cap->release_frame(frame_data);
-                std::cerr << "[PyWGCCapture] C++: Python callback completed" << std::endl;
+                if (debug_mode) std::cerr << "[PyWGCCapture] C++: Python callback completed" << std::endl;
             } catch (const py::error_already_set& e) {
-                std::cerr << "[PyWGCCapture] C++: Python error in callback: " << e.what() << std::endl;
+                if (debug_mode) std::cerr << "[PyWGCCapture] C++: Python error in callback: " << e.what() << std::endl;
             }
         });
     }
@@ -107,13 +117,14 @@ private:
 void set_debug(bool value) { debug_mode = value; }
 
 PYBIND11_MODULE(wgc_capture, m) {
-    m.doc() = "Windows Graphics Capture module"; 
+    m.doc() = "Windows Graphics Capture module";
 
     py::class_<PyWGCCapture>(m, "WGCCapture")
         .def(py::init<>())
         .def("set_frame_callback", &PyWGCCapture::set_frame_callback)
         .def("get_monitor_info", &PyWGCCapture::get_monitor_info)
-        .def("get_frame", &PyWGCCapture::get_frame, py::arg("timeout_ms") = 1);
+        .def("get_frame", &PyWGCCapture::get_frame, py::arg("timeout_ms") = 1)
+        .def("capture_to_cuda", &PyWGCCapture::capture_to_cuda);
     
     m.def("set_debug", &set_debug, "Enable or disable debug output");
 } 

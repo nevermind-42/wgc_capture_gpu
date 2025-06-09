@@ -3,6 +3,7 @@
 #include <chrono>
 #include <thread>
 #include <iostream>
+#include "dxgi_access.h"
 
 // WinRT initialization
 struct WinRTInitializer {
@@ -19,30 +20,13 @@ static WinRTInitializer g_winrt_initializer;
 
 // Helper functions for WinRT and DirectX
 namespace {
-    // Create IDirect3DDevice from ID3D11Device
-    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice CreateDirect3DDevice(ID3D11Device* d3d_device) {
-        ComPtr<IDXGIDevice> dxgi_device;
-        HRESULT hr = d3d_device->QueryInterface(IID_PPV_ARGS(&dxgi_device));
-        if (FAILED(hr)) {
-            std::cerr << "Failed to get DXGI device: " << std::hex << hr << std::endl;
-            return nullptr;
-        }
-
-        winrt::com_ptr<::IInspectable> inspectable;
-        hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable.put());
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create Direct3D11 device from DXGI device: " << std::hex << hr << std::endl;
-            return nullptr;
-        }
-
-        return inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
-    }
-
     // Get ID3D11Device from IDirect3DDevice
     ComPtr<ID3D11Device> GetD3D11Device(winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice const& device) {
-        auto access = device.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+        winrt::com_ptr<IUnknown> unk = device.as<IUnknown>();
+        ComPtr<IDirect3DDxgiInterfaceAccess> dxgi_access;
+        unk->QueryInterface(__uuidof(IDirect3DDxgiInterfaceAccess), reinterpret_cast<void**>(dxgi_access.GetAddressOf()));
         ComPtr<ID3D11Device> d3d_device;
-        HRESULT hr = access->GetInterface(IID_PPV_ARGS(&d3d_device));
+        HRESULT hr = dxgi_access->GetInterface(IID_PPV_ARGS(&d3d_device));
         if (FAILED(hr)) {
             std::cerr << "Failed to get D3D11Device from IDirect3DDevice: " << std::hex << hr << std::endl;
             return nullptr;
@@ -56,7 +40,7 @@ namespace {
         auto activation_factory = winrt::get_activation_factory<
             winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
             IGraphicsCaptureItemInterop>();
-        winrt::Windows::Graphics::Capture::GraphicsCaptureItem item = { nullptr };
+        winrt::Windows::Graphics::Capture::GraphicsCaptureItem item = nullptr;
         HRESULT hr = activation_factory->CreateForMonitor(
             hmon,
             winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
@@ -117,8 +101,12 @@ WGCCapture::WGCCapture(bool use_bgra) : is_capturing_(false) {
         for (UINT j = 0; adapter->EnumOutputs(j, output.GetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++j) {
             DXGI_OUTPUT_DESC output_desc;
             output->GetDesc(&output_desc);
-            monitor_info_.push_back({output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left,
-                                   output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top});
+            monitor_info_.push_back(std::make_tuple(
+                output_desc.DesktopCoordinates.left,
+                output_desc.DesktopCoordinates.top,
+                output_desc.DesktopCoordinates.right,
+                output_desc.DesktopCoordinates.bottom
+            ));
             output.Reset();
         }
         adapter.Reset();
@@ -126,10 +114,130 @@ WGCCapture::WGCCapture(bool use_bgra) : is_capturing_(false) {
     
     std::cout << "[WGCCapture] Found " << monitor_info_.size() << " monitors" << std::endl;
     std::cout << "[WGCCapture] Initialization complete" << std::endl;
+
+    // Создаем CUDA поток
+    cudaError_t err = cudaStreamCreate(&cuda_stream_);
+    if (err != cudaSuccess) {
+        std::cerr << "[WGCCapture] Failed to create CUDA stream: " << cudaGetErrorString(err) << std::endl;
+        throw std::runtime_error("Failed to create CUDA stream");
+    }
 }
 
 WGCCapture::~WGCCapture() {
     stop_capture();
+    cleanup_cuda_resources();
+}
+
+void WGCCapture::cleanup_cuda_resources() {
+    if (cuda_resource_) {
+        cudaGraphicsUnregisterResource(cuda_resource_);
+        cuda_resource_ = nullptr;
+    }
+    if (cuda_stream_) {
+        cudaStreamDestroy(cuda_stream_);
+        cuda_stream_ = nullptr;
+    }
+}
+
+bool WGCCapture::init_cuda_interop(ID3D11Texture2D* texture) {
+    if (!texture) return false;
+    
+    // Если ресурс уже зарегистрирован, освобождаем его
+    if (cuda_resource_) {
+        cudaGraphicsUnregisterResource(cuda_resource_);
+        cuda_resource_ = nullptr;
+    }
+    
+    // Регистрируем DirectX текстуру как CUDA ресурс
+    cudaError_t err = cudaGraphicsD3D11RegisterResource(
+        &cuda_resource_,
+        texture,
+        cudaGraphicsRegisterFlagsNone
+    );
+    
+    if (err != cudaSuccess) {
+        std::cerr << "[WGCCapture] Failed to register CUDA resource: " << cudaGetErrorString(err) << std::endl;
+        return false;
+    }
+    
+    return true;
+}
+
+bool WGCCapture::capture_to_cuda(void** cuda_ptr, size_t* pitch) {
+    if (!is_capturing_ || !cuda_ptr || !pitch) return false;
+    
+    try {
+        // Получаем кадр
+        auto frame = frame_pool_.TryGetNextFrame();
+        if (!frame) return false;
+        
+        // Получаем текстуру
+        auto surface = frame.Surface();
+        winrt::com_ptr<IUnknown> surface_unk = surface.as<IUnknown>();
+        ComPtr<IDirect3DDxgiInterfaceAccess> dxgi_access;
+        surface_unk->QueryInterface(__uuidof(IDirect3DDxgiInterfaceAccess), reinterpret_cast<void**>(dxgi_access.GetAddressOf()));
+        ComPtr<ID3D11Texture2D> texture;
+        HRESULT hr = dxgi_access->GetInterface(IID_PPV_ARGS(&texture));
+        if (FAILED(hr)) {
+            std::cerr << "[WGCCapture] Failed to get texture from frame: " << std::hex << hr << std::endl;
+            return false;
+        }
+        
+        // Получаем описание текстуры
+        D3D11_TEXTURE2D_DESC desc;
+        texture->GetDesc(&desc);
+        
+        // Сохраняем размеры
+        width_ = desc.Width;
+        height_ = desc.Height;
+        
+        // Инициализируем CUDA интероп если нужно
+        if (!cuda_resource_) {
+            if (!init_cuda_interop(texture.Get())) {
+                return false;
+            }
+        }
+        
+        // Маппим CUDA ресурс
+        cudaError_t err = cudaGraphicsMapResources(1, &cuda_resource_, cuda_stream_);
+        if (err != cudaSuccess) {
+            std::cerr << "[WGCCapture] Failed to map CUDA resource: " << cudaGetErrorString(err) << std::endl;
+            return false;
+        }
+        
+        // Получаем указатель на CUDA память
+        cudaArray_t cuda_array;
+        err = cudaGraphicsSubResourceGetMappedArray(&cuda_array, cuda_resource_, 0, 0);
+        if (err != cudaSuccess) {
+            std::cerr << "[WGCCapture] Failed to get mapped array: " << cudaGetErrorString(err) << std::endl;
+            cudaGraphicsUnmapResources(1, &cuda_resource_, cuda_stream_);
+            return false;
+        }
+        
+        // Копируем данные в CUDA память
+        err = cudaMemcpy2DAsync(
+            *cuda_ptr,
+            *pitch,
+            cuda_array,
+            0,
+            width_ * sizeof(uint8_t) * 4,  // 4 канала (RGBA)
+            height_,
+            cudaMemcpyDeviceToDevice,
+            cuda_stream_
+        );
+        
+        // Размаппим ресурс
+        cudaGraphicsUnmapResources(1, &cuda_resource_, cuda_stream_);
+        
+        // Синхронизируем поток
+        cudaStreamSynchronize(cuda_stream_);
+        
+        return err == cudaSuccess;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "[WGCCapture] Exception in capture_to_cuda: " << e.what() << std::endl;
+        return false;
+    }
 }
 
 bool WGCCapture::start_capture() {
@@ -173,9 +281,11 @@ bool WGCCapture::start_capture() {
             
             // Получаем текстуру
             auto surface = frame.Surface();
-            auto access = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+            winrt::com_ptr<IUnknown> surface_unk = surface.as<IUnknown>();
+            ComPtr<IDirect3DDxgiInterfaceAccess> dxgi_access;
+            surface_unk->QueryInterface(__uuidof(IDirect3DDxgiInterfaceAccess), reinterpret_cast<void**>(dxgi_access.GetAddressOf()));
             ComPtr<ID3D11Texture2D> texture;
-            HRESULT hr = access->GetInterface(IID_PPV_ARGS(&texture));
+            HRESULT hr = dxgi_access->GetInterface(IID_PPV_ARGS(&texture));
             if (FAILED(hr)) {
                 std::cerr << "[WGCCapture] Failed to get texture from frame: " << std::hex << hr << std::endl;
                 return;
@@ -305,7 +415,7 @@ void WGCCapture::set_frame_callback(std::function<void(FrameData*)> callback) {
     frame_callback_ = callback;
 }
 
-std::vector<std::pair<int, int>> WGCCapture::get_monitor_info() const {
+std::vector<std::tuple<int, int, int, int>> WGCCapture::get_monitor_info() const {
     return monitor_info_;
 }
 
@@ -339,4 +449,26 @@ void WGCCapture::release_frame(FrameData* frame) {
 
 FrameData* WGCCapture::allocate_frame_data() {
     return new FrameData();
+}
+
+winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item_ = nullptr;
+winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool_ = nullptr;
+winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session_ = nullptr;
+
+winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice WGCCapture::CreateDirect3DDevice(ID3D11Device* d3d_device) {
+    ComPtr<IDXGIDevice> dxgi_device;
+    HRESULT hr = d3d_device->QueryInterface(IID_PPV_ARGS(&dxgi_device));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to get DXGI device: " << std::hex << hr << std::endl;
+        return nullptr;
+    }
+
+    winrt::com_ptr<::IInspectable> inspectable;
+    hr = CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable.put());
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create Direct3D11 device from DXGI device: " << std::hex << hr << std::endl;
+        return nullptr;
+    }
+
+    return inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 } 
