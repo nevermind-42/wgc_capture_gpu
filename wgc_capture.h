@@ -47,6 +47,16 @@ struct TextureResource {
     TextureResource() : texture(nullptr), width(0), height(0), pitch(0), timestamp(0) {}
 };
 
+// Структура для передачи в колбэк по событию кадра
+struct FrameCallbackData {
+    ID3D11Texture2D* texture;        // Указатель на текстуру D3D11
+    int width;                       // Ширина текстуры
+    int height;                      // Высота текстуры
+    int64_t timestamp;               // Временная метка
+    
+    FrameCallbackData() : texture(nullptr), width(0), height(0), timestamp(0) {}
+};
+
 class WGCCapture {
 public:
     WGCCapture(bool use_bgra = true);
@@ -56,10 +66,13 @@ public:
     bool start_capture();
     void stop_capture();
     
-    // Установка callback для новых кадров
+    // Установка callback для новых кадров (старый метод для совместимости)
     // callback получает указатель на FrameData, который можно безопасно использовать
     // пока не вызван метод release_frame
     void set_frame_callback(std::function<void(FrameData*)> callback);
+    
+    // Новый метод колбэка с прямой передачей текстуры D3D11
+    void set_texture_callback(std::function<void(FrameCallbackData*)> callback);
     
     // Получение информации о мониторе
     std::vector<std::pair<int, int>> get_monitor_info() const;
@@ -108,6 +121,9 @@ private:
     
     // Callback для новых кадров
     std::function<void(FrameData*)> frame_callback_;
+    
+    // Callback для новых текстур D3D11 (прямая передача)
+    std::function<void(FrameCallbackData*)> texture_callback_;
     
     // Информация о мониторе
     std::vector<std::pair<int, int>> monitor_info_;

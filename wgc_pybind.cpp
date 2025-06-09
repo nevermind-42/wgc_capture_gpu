@@ -14,7 +14,7 @@ namespace py = pybind11;
 using ssize_t = py::ssize_t;
 
 namespace {
-    bool debug_mode = false;
+    bool debug_mode = true;
 }
 
 class PyWGCCapture {
@@ -54,10 +54,10 @@ public:
         }
     }
 
-    // Set callback for new frames
+    // Set callback for new frames with direct texture access
     void set_frame_callback(py::function callback) {
         cap->set_frame_callback([callback, this](FrameData* frame_data) {
-            std::cerr << "[PyWGCCapture] C++: frame_callback called, frame=" << (frame_data ? "OK" : "nullptr") << std::endl;
+            if (debug_mode) std::cerr << "[PyWGCCapture] C++: frame_callback called, frame=" << (frame_data ? "OK" : "nullptr") << std::endl;
             py::gil_scoped_acquire gil;
             if (!frame_data || frame_data->frame.empty()) {
                 std::cerr << "[PyWGCCapture] C++: frame_data is empty in callback" << std::endl;
@@ -79,6 +79,15 @@ public:
             }
             py_info["is_bgra"] = frame_data->is_bgra;
             py_info["timestamp"] = frame_data->timestamp;
+            
+            // Add D3D11 texture info for direct GPU processing
+            TextureResource texture = cap->get_texture_resource();
+            py_info["texture_ptr"] = reinterpret_cast<uint64_t>(texture.texture);
+            py_info["texture_width"] = texture.width;
+            py_info["texture_height"] = texture.height;
+            py_info["texture_pitch"] = texture.pitch;
+            py_info["d3d11_device_ptr"] = reinterpret_cast<uint64_t>(cap->get_d3d11_device());
+            
             try {
                 std::cerr << "[PyWGCCapture] C++: calling Python callback..." << std::endl;
                 callback(array, py_info);
@@ -86,6 +95,39 @@ public:
                 std::cerr << "[PyWGCCapture] C++: Python callback completed" << std::endl;
             } catch (const py::error_already_set& e) {
                 std::cerr << "[PyWGCCapture] C++: Python error in callback: " << e.what() << std::endl;
+            }
+        });
+    }
+
+    // Новый метод колбэка с прямой передачей текстуры D3D11
+    void set_texture_callback(py::function callback) {
+        if (debug_mode) std::cerr << "[PyWGCCapture] Setting texture callback..." << std::endl;
+        
+        cap->set_texture_callback([callback, this](FrameCallbackData* data) {
+            if (debug_mode) std::cerr << "[PyWGCCapture] C++: texture_callback called, texture=" 
+                << (data && data->texture ? "OK" : "nullptr") << std::endl;
+            
+            py::gil_scoped_acquire gil;
+            
+            if (!data || !data->texture) {
+                std::cerr << "[PyWGCCapture] C++: texture_data is nullptr in callback" << std::endl;
+                return;
+            }
+            
+            // Создаем словарь с информацией о текстуре для передачи в Python
+            py::dict texture_info;
+            texture_info["texture_ptr"] = reinterpret_cast<uint64_t>(data->texture);
+            texture_info["width"] = data->width;
+            texture_info["height"] = data->height;
+            texture_info["timestamp"] = data->timestamp;
+            texture_info["d3d11_device_ptr"] = reinterpret_cast<uint64_t>(cap->get_d3d11_device());
+            
+            try {
+                if (debug_mode) std::cerr << "[PyWGCCapture] C++: calling Python texture callback..." << std::endl;
+                callback(texture_info);
+                if (debug_mode) std::cerr << "[PyWGCCapture] C++: Python texture callback completed" << std::endl;
+            } catch (const py::error_already_set& e) {
+                std::cerr << "[PyWGCCapture] C++: Python error in texture callback: " << e.what() << std::endl;
             }
         });
     }
@@ -148,6 +190,7 @@ PYBIND11_MODULE(wgc_capture, m) {
     py::class_<PyWGCCapture>(m, "WGCCapture")
         .def(py::init<>())
         .def("set_frame_callback", &PyWGCCapture::set_frame_callback)
+        .def("set_texture_callback", &PyWGCCapture::set_texture_callback)
         .def("get_monitor_info", &PyWGCCapture::get_monitor_info)
         .def("get_frame", &PyWGCCapture::get_frame, py::arg("timeout_ms") = 1)
         .def("has_new_texture", &PyWGCCapture::has_new_texture)

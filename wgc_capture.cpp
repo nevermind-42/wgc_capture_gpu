@@ -193,39 +193,52 @@ bool WGCCapture::start_capture() {
                 last_texture_timestamp_ = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 has_new_texture_ = true;
+                
+                // Если установлен текстурный колбэк, вызываем его с прямым указателем на текстуру
+                if (texture_callback_) {
+                    FrameCallbackData data;
+                    data.texture = last_texture_.Get();
+                    data.width = desc.Width;
+                    data.height = desc.Height;
+                    data.timestamp = last_texture_timestamp_;
+                    texture_callback_(&data);
+                }
             }
             
-            // Создаем текстуру для чтения
-            ComPtr<ID3D11Texture2D> staging_texture;
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            desc.BindFlags = 0;
-            desc.MiscFlags = 0;
-            
-            hr = d3d_device_->CreateTexture2D(&desc, nullptr, staging_texture.GetAddressOf());
-            if (FAILED(hr)) {
-                std::cerr << "[WGCCapture] Failed to create staging texture: " << std::hex << hr << std::endl;
-                return;
+            // Если установлен старый колбэк, используем прежнюю логику для совместимости
+            if (frame_callback_) {
+                // Создаем текстуру для чтения
+                ComPtr<ID3D11Texture2D> staging_texture;
+                desc.Usage = D3D11_USAGE_STAGING;
+                desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                desc.BindFlags = 0;
+                desc.MiscFlags = 0;
+                
+                hr = d3d_device_->CreateTexture2D(&desc, nullptr, staging_texture.GetAddressOf());
+                if (FAILED(hr)) {
+                    std::cerr << "[WGCCapture] Failed to create staging texture: " << std::hex << hr << std::endl;
+                    return;
+                }
+                
+                // Копируем данные
+                d3d_context_->CopyResource(staging_texture.Get(), texture.Get());
+                
+                // Маппим текстуру для чтения
+                D3D11_MAPPED_SUBRESOURCE mapped;
+                hr = d3d_context_->Map(staging_texture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+                if (FAILED(hr)) {
+                    std::cerr << "[WGCCapture] Failed to map staging texture: " << std::hex << hr << std::endl;
+                    return;
+                }
+                
+                // Создаем OpenCV матрицу напрямую из маппированной памяти
+                cv::Mat frame_bgra(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
+                
+                // Обрабатываем кадр напрямую без конвертации цвета
+                process_frame(frame_bgra, true);
+                
+                d3d_context_->Unmap(staging_texture.Get(), 0);
             }
-            
-            // Копируем данные
-            d3d_context_->CopyResource(staging_texture.Get(), texture.Get());
-            
-            // Маппим текстуру для чтения
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            hr = d3d_context_->Map(staging_texture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-            if (FAILED(hr)) {
-                std::cerr << "[WGCCapture] Failed to map staging texture: " << std::hex << hr << std::endl;
-                return;
-            }
-            
-            // Создаем OpenCV матрицу напрямую из маппированной памяти
-            cv::Mat frame_bgra(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
-            
-            // Обрабатываем кадр напрямую без конвертации цвета
-            process_frame(frame_bgra, true);
-            
-            d3d_context_->Unmap(staging_texture.Get(), 0);
         });
         
         // Создаем сессию захвата
@@ -322,6 +335,12 @@ void WGCCapture::set_frame_callback(std::function<void(FrameData*)> callback) {
     frame_callback_ = callback;
 }
 
+// Реализация нового метода колбэка с текстурой
+void WGCCapture::set_texture_callback(std::function<void(FrameCallbackData*)> callback) {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    texture_callback_ = callback;
+}
+
 std::vector<std::pair<int, int>> WGCCapture::get_monitor_info() const {
     return monitor_info_;
 }
@@ -358,37 +377,33 @@ FrameData* WGCCapture::allocate_frame_data() {
     return new FrameData();
 }
 
-// Новые методы для работы с текстурой D3D11
-
+// Возвращает информацию о текстуре для использования в CUDA/PyTorch
 TextureResource WGCCapture::get_texture_resource() {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     
-    TextureResource resource;
-    if (!last_texture_) {
-        return resource;
+    TextureResource result;
+    result.texture = last_texture_.Get();
+    
+    if (result.texture) {
+        D3D11_TEXTURE2D_DESC desc;
+        result.texture->GetDesc(&desc);
+        
+        result.width = desc.Width;
+        result.height = desc.Height;
+        result.pitch = desc.Width * 4; // BGRA = 4 байта на пиксель
+        result.timestamp = last_texture_timestamp_;
     }
     
-    // Получаем текстуру и ее описание
-    D3D11_TEXTURE2D_DESC desc;
-    last_texture_->GetDesc(&desc);
-    
-    resource.texture = last_texture_.Get();
-    resource.width = desc.Width;
-    resource.height = desc.Height;
-    resource.pitch = desc.Width * 4; // BGRA формат, 4 байта на пиксель
-    resource.timestamp = last_texture_timestamp_;
-    
-    // Сбрасываем флаг новой текстуры
-    has_new_texture_ = false;
-    
-    return resource;
+    return result;
 }
 
+// Проверяет, есть ли новая текстура
 bool WGCCapture::has_new_texture() const {
     std::lock_guard<std::mutex> lock(frame_mutex_);
-    return has_new_texture_ && last_texture_ != nullptr;
+    return has_new_texture_;
 }
 
+// Возвращает размеры текущей текстуры
 std::pair<int, int> WGCCapture::get_texture_size() const {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     
@@ -399,5 +414,5 @@ std::pair<int, int> WGCCapture::get_texture_size() const {
     D3D11_TEXTURE2D_DESC desc;
     last_texture_->GetDesc(&desc);
     
-    return {static_cast<int>(desc.Width), static_cast<int>(desc.Height)};
+    return {desc.Width, desc.Height};
 } 
