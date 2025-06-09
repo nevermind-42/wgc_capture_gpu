@@ -1,5 +1,9 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.15)
 project(wgc_capture)
+
+# Стандарт C++17 (необходим для WinRT)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Находим CUDA
 find_package(CUDA REQUIRED)
@@ -9,71 +13,49 @@ include_directories(${CUDA_INCLUDE_DIRS})
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 include_directories(${Python_INCLUDE_DIRS})
 
-# Добавляем исходные файлы для Python модуля
+# Пути к OpenCV
+set(OPENCV_INCLUDE "C:/Tools/opencv/4.1.0/opencv/build/include")
+set(OPENCV_LIB "C:/Tools/opencv/4.1.0/opencv/build/x64/vc16/lib")
+set(OPENCV_LIB_NAME "opencv_world4100")
+include_directories(${OPENCV_INCLUDE})
+link_directories(${OPENCV_LIB})
+
+# Настройки для Windows и WinRT
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /await")
+set(REQUIRED_LIBS 
+    windowsapp
+    d3d11
+    dxgi
+    dwmapi
+    shcore
+)
+
+# Добавляем путь к pybind11
+add_subdirectory(${CMAKE_SOURCE_DIR}/../pybind11 pybind11_build)
+
+# Исходные файлы для модуля
 add_library(wgc_capture SHARED
     wgc_capture.cpp
     wgc_pybind.cpp
 )
 
-# Добавляем статическую библиотеку для тестов
-add_library(wgc_capture_static STATIC
-    wgc_capture.cpp
-)
-
-# Добавляем тестовый исполняемый файл
-add_executable(test_capture
-    test_capture.cpp
-)
-
-# Вместо find_package(pybind11 CONFIG REQUIRED)
-add_subdirectory(${CMAKE_SOURCE_DIR}/../pybind11 pybind11_build)
-
-include_directories("C:/Tools/opencv/4.1.0/opencv/build/include")
-
-target_link_directories(wgc_capture PRIVATE "C:/Tools/opencv/4.1.0/opencv/build/x64/vc16/lib")
-target_link_directories(wgc_capture_static PRIVATE "C:/Tools/opencv/4.1.0/opencv/build/x64/vc16/lib")
-target_link_directories(test_capture PRIVATE "C:/Tools/opencv/4.1.0/opencv/build/x64/vc16/lib")
-
-# Линкуем с библиотеками
+# Линкуем с необходимыми библиотеками
 target_link_libraries(wgc_capture PRIVATE
     pybind11::module
-    opencv_world410
-    d3d11
-    dxgi
-    dcomp
-    windowsapp
+    ${OPENCV_LIB_NAME}
+    ${REQUIRED_LIBS}
     ${CUDA_LIBRARIES}
 )
 
-target_link_libraries(wgc_capture_static PRIVATE
-    opencv_world410
-    d3d11
-    dxgi
-    dcomp
-    windowsapp
-    ${CUDA_LIBRARIES}
+# Копирование CUDA DLL в директорию сборки
+add_custom_command(TARGET wgc_capture POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CUDA_TOOLKIT_ROOT_DIR}/bin/cudart64_12.dll"
+    $<TARGET_FILE_DIR:wgc_capture>
 )
 
-target_link_libraries(test_capture PRIVATE
-    wgc_capture_static
-    opencv_world410
-    d3d11
-    dxgi
-    dcomp
-    windowsapp
-    ${CUDA_LIBRARIES}
-)
-
-# Устанавливаем флаги компиляции
-target_compile_features(wgc_capture PRIVATE cxx_std_17)
-target_compile_features(wgc_capture_static PRIVATE cxx_std_17)
-target_compile_features(test_capture PRIVATE cxx_std_17)
-target_compile_options(wgc_capture PRIVATE /W4 /WX-)
-target_compile_options(wgc_capture_static PRIVATE /W4 /WX-)
-target_compile_options(test_capture PRIVATE /W4 /WX-)
-
-# Устанавливаем имя выходного файла
+# Устанавливаем имя выходного файла (.pyd для Python)
 set_target_properties(wgc_capture PROPERTIES
     PREFIX ""
     SUFFIX ".pyd"
-)
+) 

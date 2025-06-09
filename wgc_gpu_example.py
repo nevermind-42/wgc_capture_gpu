@@ -1,88 +1,90 @@
-import wgc_capture
-import numpy as np
-import cv2
 import time
-
-try:
-    import pycuda.driver as cuda
-    import pycuda.autoinit
-    import pycuda.gpuarray as gpuarray
-    HAS_CUDA = True
-except ImportError:
-    print("PyCUDA не установлен, будет использован альтернативный режим")
-    HAS_CUDA = False
+import numpy as np
+import wgc_capture
+import pycuda.driver as cuda
+import pycuda.autoinit
+# Удаляем импорты связанные с OpenGL
+# from pycuda.gl import graphics_map_flags
+# import pycuda.gl.autoinit
+import cv2
 
 def main():
-    print("Инициализация захвата экрана...")
-    # Включаем отладочный вывод
+    # Включаем режим отладки
     wgc_capture.set_debug(True)
+    
+    # Создаем экземпляр WGCCapture
+    print("Создаем экземпляр WGCCapture...")
     cap = wgc_capture.WGCCapture()
     
-    # Выполняем 10 секунд захвата кадров
-    start_time = time.time()
-    frame_count = 0
+    # Получаем информацию о мониторах
+    monitors = cap.get_monitor_info()
+    print(f"Найдено {len(monitors)} мониторов:")
+    for i, (width, height) in enumerate(monitors):
+        print(f"  Монитор {i+1}: {width}x{height}")
     
-    print("\n--- Демонстрация захвата напрямую в CUDA память ---")
-    if HAS_CUDA:
-        while time.time() - start_time < 10:
-            # Захват кадра напрямую в память CUDA
-            result = cap.capture_to_cuda_ptr()
-            if result is None:
-                time.sleep(0.001)  # Небольшая задержка, если кадр недоступен
-                continue
+    # Проверяем наличие новой текстуры
+    print("Ожидаем захват первого кадра...")
+    while not cap.has_new_texture():
+        time.sleep(0.1)
+    
+    # Получаем размер текстуры
+    width, height = cap.get_texture_size()
+    print(f"Размер текстуры: {width}x{height}")
+    
+    # Получаем указатель на D3D11 устройство для регистрации в CUDA
+    d3d11_device_ptr = cap.get_d3d11_device_ptr()
+    print(f"Указатель на D3D11 устройство: {d3d11_device_ptr:x}")
+    
+    # PyCUDA обработка
+    # В реальном приложении здесь нужно использовать CUDA для взаимодействия с D3D11
+    # Это примерный код, который нужно адаптировать под конкретные нужды
+    
+    # Функция для обработки каждого кадра через PyCUDA
+    def process_frame_gpu():
+        # Получаем информацию о текстуре
+        texture_info = cap.get_texture_info()
+        if not texture_info:
+            print("Нет доступной текстуры")
+            return None
+        
+        print(f"Текстура: {texture_info['width']}x{texture_info['height']}, timestamp: {texture_info['timestamp']}")
+        
+        # В реальном приложении здесь будет код для:
+        # 1. Регистрации D3D11 текстуры в CUDA (через cuda.D3D11DeviceList)
+        # 2. Маппинга ресурса и получения указателя на память CUDA
+        # 3. Выполнения CUDA операций с текстурой
+        # 4. Размаппинга ресурса
+        
+        # Вместо этого в данном примере просто получаем кадр как NumPy массив
+        # для демонстрации
+        return cap.get_frame()
+    
+    # Основной цикл обработки
+    print("Начинаем обработку кадров...")
+    try:
+        window_name = "WGC CUDA Example"
+        cv2.namedWindow(window_name)
+        
+        while True:
+            # Ждем новый кадр
+            if cap.has_new_texture():
+                # Обрабатываем кадр через GPU
+                frame = process_frame_gpu()
+                
+                if frame is not None:
+                    # Выводим результат
+                    cv2.imshow(window_name, frame)
             
-            # Распаковываем результат (указатель на память CUDA, pitch, width, height)
-            cuda_ptr, pitch, width, height = result
-            
-            # Создаем GPUArray из указателя (для дальнейшей обработки на GPU)
-            gpu_alloc = cuda.DeviceAllocation(cuda_ptr)
-            
-            # ВАЖНО: мы не владеем этой памятью, она принадлежит WGC
-            # Поэтому мы не должны её освобождать
-            
-            # Создаем GPUArray для обработки/отображения
-            # Для демонстрации, просто копируем данные на CPU
-            frame_gpu = gpuarray.GPUArray((height, width, 4), np.uint8, gpudata=gpu_alloc)
-            frame_cpu = frame_gpu.get()
-            
-            # Обработка кадра (например, преобразование BGR в RGB)
-            frame_rgb = cv2.cvtColor(frame_cpu, cv2.COLOR_BGRA2RGB)
-            
-            # Отображаем кадр (можно закомментировать для бенчмаркинга)
-            cv2.imshow('WGC Screen Capture (GPU Mode)', frame_rgb)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Проверяем нажатие клавиши
+            key = cv2.waitKey(1)
+            if key == ord('q') or key == 27:  # q или Esc
                 break
-            
-            frame_count += 1
-    else:
-        print("PyCUDA не установлен, используем обычный режим")
-        while time.time() - start_time < 10:
-            # Получаем кадр вместе с метаданными
-            frame, info = cap.get_frame_with_info()
-            
-            if frame.size == 0:
-                time.sleep(0.001)  # Небольшая задержка, если кадр недоступен
-                continue
-            
-            # Выводим метаданные для первого кадра
-            if frame_count == 0:
-                print(f"Метаданные кадра: {info}")
-            
-            # Отображаем кадр (можно закомментировать для бенчмаркинга)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-            cv2.imshow('WGC Screen Capture (CPU Mode)', frame_rgb)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            
-            frame_count += 1
-    
-    end_time = time.time()
-    duration = end_time - start_time
-    
-    print(f"\nЗахвачено {frame_count} кадров за {duration:.2f} секунд")
-    print(f"Средняя частота кадров: {frame_count / duration:.1f} FPS")
-    
-    cv2.destroyAllWindows()
+                
+    except KeyboardInterrupt:
+        print("Прервано пользователем")
+    finally:
+        cv2.destroyAllWindows()
+        print("Завершение работы...")
 
 if __name__ == "__main__":
     main() 

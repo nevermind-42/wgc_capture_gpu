@@ -5,88 +5,115 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <vector>
+#include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <map>
+#include <any>
 #include <tuple>
 #include <atomic>
+#include <opencv2/opencv.hpp>
+
+// Включения для Windows Graphics Capture API
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
-#include <cuda_runtime.h>
-#include <cuda_d3d11_interop.h>
 
 using Microsoft::WRL::ComPtr;
-using namespace winrt;
+
+// Структура для хранения кадра и его метаданных
+struct FrameData {
+    cv::Mat frame;                           // Кадр (BGRA формат)
+    std::map<std::string, std::any> info;    // Метаданные кадра
+    int64_t timestamp;                       // Временная метка кадра
+    bool is_bgra;                            // Флаг формата (всегда true для BGRA)
+    int ref_count;                           // Счетчик ссылок для отслеживания использования
+
+    FrameData() : timestamp(0), is_bgra(true), ref_count(0) {}
+};
+
+// Структура для хранения информации о текстуре D3D11 для использования в CUDA
+struct TextureResource {
+    ID3D11Texture2D* texture;        // Указатель на текстуру D3D11
+    int width;                       // Ширина текстуры
+    int height;                      // Высота текстуры
+    int pitch;                       // Шаг строки в байтах
+    int64_t timestamp;               // Временная метка
+    
+    TextureResource() : texture(nullptr), width(0), height(0), pitch(0), timestamp(0) {}
+};
 
 class WGCCapture {
 public:
-    WGCCapture();
+    WGCCapture(bool use_bgra = true);
     ~WGCCapture();
 
+    // Инициализация и запуск захвата
     bool start_capture();
     void stop_capture();
-    bool pause_capture();
-    bool resume_capture();
-    bool is_capturing() const { return is_capturing_; }
-    bool is_paused() const { return is_paused_; }
-
-    // Установка callback для новых CUDA-кадров
-    // callback получает (void* cuda_ptr, size_t pitch, int width, int height, int64_t timestamp)
-    void set_frame_callback(std::function<void(void*, size_t, int, int, int64_t)> callback);
-
-    // Получение информации о мониторах
-    std::vector<std::tuple<int, int, int, int>> get_monitor_info() const;
-
-    // Захват кадра напрямую в CUDA память (polling)
-    bool capture_to_cuda(void** cuda_ptr, size_t* pitch, int* width, int* height, int64_t* timestamp);
-
+    
+    // Установка callback для новых кадров
+    // callback получает указатель на FrameData, который можно безопасно использовать
+    // пока не вызван метод release_frame
+    void set_frame_callback(std::function<void(FrameData*)> callback);
+    
+    // Получение информации о мониторе
+    std::vector<std::pair<int, int>> get_monitor_info() const;
+    
+    // Получение кадра
+    // Возвращает указатель на FrameData, который нужно освободить через release_frame
+    FrameData* get_frame();
+    
+    // Освобождение кадра (уменьшение счетчика ссылок)
+    void release_frame(FrameData* frame);
+    
+    // Новые методы для работы с D3D11 текстурой
+    // Получить указатель на текстуру и ее свойства
+    TextureResource get_texture_resource();
+    
+    // Получить устройство D3D11 для регистрации в CUDA
+    ID3D11Device* get_d3d11_device() { return d3d_device_.Get(); }
+    
+    // Проверить, изменилась ли текстура с последнего вызова
+    bool has_new_texture() const;
+    
+    // Получить размеры текущей текстуры
+    std::pair<int, int> get_texture_size() const;
+    
 private:
+    // Внутренние методы
+    void process_frame(cv::Mat& frame, bool is_bgra);
+    FrameData* allocate_frame_data();
+    
     // Члены класса для Direct3D
     ComPtr<ID3D11Device> d3d_device_;
     ComPtr<ID3D11DeviceContext> d3d_context_;
-    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice d3d_device_winrt_;
-
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice d3d_device_winrt_{nullptr};
+    
     // Члены класса для Windows Graphics Capture
-    winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item_ = nullptr;
-    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool_ = nullptr;
-    winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session_ = nullptr;
-
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item_{nullptr};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool_{nullptr};
+    winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session_{nullptr};
+    
+    // Члены класса для управления кадрами
     mutable std::mutex frame_mutex_;
-    std::function<void(void*, size_t, int, int, int64_t)> frame_callback_;
-    bool is_capturing_ = false;
-    bool is_paused_ = false;
-
-    // CUDA ресурсы
-    cudaGraphicsResource* cuda_resource_ = nullptr;
-    cudaStream_t cuda_stream_ = nullptr;
-
-    // Размеры захвата
-    int width_ = 0;
-    int height_ = 0;
-
-    // Последний timestamp
-    int64_t last_timestamp_ = 0;
-
-    // Последний указатель на texture (для polling)
+    std::condition_variable frame_cv_;
+    
+    FrameData current_frame_;  // Текущий кадр (без буферизации)
+    bool is_capturing_;
+    
+    // Callback для новых кадров
+    std::function<void(FrameData*)> frame_callback_;
+    
+    // Информация о мониторе
+    std::vector<std::pair<int, int>> monitor_info_;
+    
+    // Последняя текстура
     ComPtr<ID3D11Texture2D> last_texture_;
-
-    // GPU frame buffer for persistent polling
-    void* gpu_frame_buffer_ = nullptr;
-    size_t gpu_frame_pitch_ = 0;
-    int gpu_frame_width_ = 0;
-    int gpu_frame_height_ = 0;
-
-    // Инициализация CUDA-D3D11 интеропа
-    bool init_cuda_interop(ID3D11Texture2D* texture);
-    void cleanup_cuda_resources();
-
-    // Вспомогательные функции
-    static winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice CreateDirect3DDevice(ID3D11Device* d3d_device);
-    static ComPtr<ID3D11Device> GetD3D11Device(winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice const& device);
-
-    std::vector<std::tuple<int, int, int, int>> monitor_info_;
+    int64_t last_texture_timestamp_;
+    bool has_new_texture_;
 }; 
