@@ -321,6 +321,7 @@ bool WGCCapture::start_capture() {
         );
         std::cout << "[WGCCapture-DEBUG] frame_pool_ created" << std::endl;
         frame_pool_.FrameArrived([this](auto&& sender, auto&&) {
+            if (!is_capturing_ || is_paused_) return;
             std::cout << "[WGCCapture-DEBUG] FrameArrived callback!" << std::endl;
             auto frame = sender.TryGetNextFrame();
             if (!frame) {
@@ -431,11 +432,14 @@ bool WGCCapture::pause_capture() {
     if (capture_session_) {
         capture_session_.Close();
         capture_session_ = nullptr;
-        is_paused_ = true;
-        std::cout << "[WGCCapture-DEBUG] Capture paused" << std::endl;
-        return true;
     }
-    return false;
+    if (frame_pool_) {
+        frame_pool_.Close();
+        frame_pool_ = nullptr;
+    }
+    is_paused_ = true;
+    std::cout << "[WGCCapture-DEBUG] Capture paused" << std::endl;
+    return true;
 }
 
 bool WGCCapture::resume_capture() {
@@ -449,9 +453,66 @@ bool WGCCapture::resume_capture() {
         std::cout << "[WGCCapture-DEBUG] Not paused" << std::endl;
         return true;
     }
-    
-    // Создаем новую сессию захвата
-    if (capture_item_ && frame_pool_) {
+    if (capture_item_ && d3d_device_winrt_) {
+        auto size = capture_item_.Size();
+        auto format = winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized;
+        frame_pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+            d3d_device_winrt_, format, 1, size
+        );
+        frame_pool_.FrameArrived([this](auto&& sender, auto&&) {
+            if (!is_capturing_ || is_paused_) return;
+            std::cout << "[WGCCapture-DEBUG] FrameArrived callback!" << std::endl;
+            auto frame = sender.TryGetNextFrame();
+            if (!frame) {
+                std::cerr << "[WGCCapture-DEBUG] frame == nullptr" << std::endl;
+                return;
+            }
+            auto surface = frame.Surface();
+            winrt::com_ptr<IUnknown> surface_unk = surface.as<IUnknown>();
+            ComPtr<IDirect3DDxgiInterfaceAccess> dxgi_access;
+            surface_unk->QueryInterface(__uuidof(IDirect3DDxgiInterfaceAccess), reinterpret_cast<void**>(dxgi_access.GetAddressOf()));
+            ComPtr<ID3D11Texture2D> texture;
+            HRESULT hr = dxgi_access->GetInterface(IID_PPV_ARGS(&texture));
+            if (FAILED(hr)) {
+                std::cerr << "[WGCCapture-DEBUG] Failed to get ID3D11Texture2D: " << std::hex << hr << std::endl;
+                return;
+            }
+            D3D11_TEXTURE2D_DESC desc;
+            texture->GetDesc(&desc);
+            width_ = desc.Width;
+            height_ = desc.Height;
+            last_texture_ = texture;
+            last_timestamp_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::cout << "[WGCCapture-DEBUG] New frame: texture=" << texture.Get() << ", size=" << width_ << "x" << height_ << ", ts=" << last_timestamp_ << std::endl;
+            // --- GPU буфер ---
+            if (!gpu_frame_buffer_ || gpu_frame_width_ != width_ || gpu_frame_height_ != height_) {
+                if (gpu_frame_buffer_) {
+                    std::cout << "[WGCCapture-DEBUG] Reallocating gpu_frame_buffer_ for new size..." << std::endl;
+                    cudaFree(gpu_frame_buffer_);
+                }
+                size_t pitch;
+                cudaError_t err = cudaMallocPitch(&gpu_frame_buffer_, &pitch, width_ * 4, height_);
+                if (err != cudaSuccess) {
+                    std::cerr << "[WGCCapture-DEBUG] Failed to allocate GPU frame buffer: " << cudaGetErrorString(err) << std::endl;
+                    return;
+                }
+                gpu_frame_pitch_ = pitch;
+                gpu_frame_width_ = width_;
+                gpu_frame_height_ = height_;
+                std::cout << "[WGCCapture-DEBUG] Allocated gpu_frame_buffer_ " << gpu_frame_buffer_ << " size=" << std::hex << (gpu_frame_pitch_ * gpu_frame_height_) << std::endl;
+            }
+            // --- CUDA interop ---
+            if (!init_cuda_interop(texture.Get())) {
+                std::cerr << "[WGCCapture-DEBUG] Failed to init CUDA interop for frame copy!" << std::endl;
+                return;
+            }
+            // --- Callback ---
+            if (frame_callback_) {
+                std::cout << "[WGCCapture-DEBUG] Calling frame_callback_..." << std::endl;
+                frame_callback_(gpu_frame_buffer_, gpu_frame_pitch_, gpu_frame_width_, gpu_frame_height_, last_timestamp_);
+            }
+        });
         capture_session_ = frame_pool_.CreateCaptureSession(capture_item_);
         capture_session_.StartCapture();
         is_paused_ = false;
