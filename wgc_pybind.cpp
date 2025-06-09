@@ -110,6 +110,15 @@ public:
         return result;
     }
 
+    // Возвращает указатель на CUDA-память и pitch как кортеж (uintptr_t, size_t)
+    py::object capture_to_cuda_ptr() {
+        void* cuda_ptr = nullptr;
+        size_t pitch = 0;
+        bool ok = cap->capture_to_cuda(&cuda_ptr, &pitch);
+        if (!ok) return py::none();
+        return py::make_tuple(reinterpret_cast<uintptr_t>(cuda_ptr), pitch);
+    }
+
 private:
     std::unique_ptr<WGCCapture> cap;
 };
@@ -124,7 +133,8 @@ PYBIND11_MODULE(wgc_capture, m) {
         .def("set_frame_callback", &PyWGCCapture::set_frame_callback)
         .def("get_monitor_info", &PyWGCCapture::get_monitor_info)
         .def("get_frame", &PyWGCCapture::get_frame, py::arg("timeout_ms") = 1)
-        .def("capture_to_cuda", &PyWGCCapture::capture_to_cuda);
+        .def("capture_to_cuda", &PyWGCCapture::capture_to_cuda)
+        .def("capture_to_cuda_ptr", &PyWGCCapture::capture_to_cuda_ptr);
     
     m.def("set_debug", &set_debug, "Enable or disable debug output");
 } 

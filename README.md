@@ -138,4 +138,49 @@ MIT License
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. 
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Python API Methods
+
+### WGCCapture
+
+#### WGCCapture()
+Создаёт объект захвата экрана и инициализирует поток захвата.
+
+#### get_frame(timeout_ms=1) -> np.ndarray
+Получает текущий кадр как numpy-массив (BGRA, uint8).
+- timeout_ms — максимальное время ожидания нового кадра (по умолчанию 1 мс).
+- Возвращает: numpy-массив кадра или пустой массив, если кадр не получен.
+
+#### set_frame_callback(callback: Callable[[np.ndarray, dict], None])
+Устанавливает callback-функцию, которая будет вызываться при появлении нового кадра.
+- callback(frame: np.ndarray, info: dict) — функция, принимающая кадр и метаданные (размер, формат, timestamp и др.).
+
+#### get_monitor_info() -> list[tuple]
+Возвращает список информации о доступных мониторах.
+- Каждый элемент — кортеж с координатами и размерами монитора.
+
+#### capture_to_cuda_ptr() -> tuple[int, int] | None
+Захватывает кадр напрямую в GPU-память (CUDA) и возвращает кортеж:
+- cuda_ptr — указатель на память на GPU (целое число, для передачи в PyCUDA и др.).
+- pitch — шаг (stride) строки в байтах.
+- Если захват не удался, возвращает None.
+
+---
+
+**Пример использования GPU-метода:**
+```python
+import wgc_capture
+import pycuda.driver as cuda
+import pycuda.autoinit
+import pycuda.gpuarray as gpuarray
+import numpy as np
+
+cap = wgc_capture.WGCCapture()
+cuda_ptr, pitch = cap.capture_to_cuda_ptr()
+if cuda_ptr is not None:
+    width, height = 1920, 1080  # замените на реальные значения
+    frame_gpu = gpuarray.GPUArray((height, width, 4), np.uint8, gpudata=cuda.DeviceAllocation(cuda_ptr))
+    frame_cpu = frame_gpu.get()
+    print("Frame shape:", frame_cpu.shape)
+``` 
